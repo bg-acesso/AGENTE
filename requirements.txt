@@ -1,8 +1,8 @@
-flask==3.0.0
-python-dotenv==1.0.0
-langchain-openai==0.1.0
-langchain-core==0.1.0
-langgraph==0.0.20
-supabase==2.3.0
-tenacity==8.2.3
-gunicorn==21.2.0
+flask
+langchain
+langchain_openai
+langgraph
+supabase
+python-dotenv
+tenacity
+requests  <-- ESSENCIAL PARA BAIXAR IMAGEM
