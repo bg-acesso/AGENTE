@@ -7,7 +7,10 @@ from typing import TypedDict, Optional
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential
-
+import urllib.parse
+import random
+import requests
+import time
 # LangChain / LangGraph / Supabase
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -152,21 +155,9 @@ def get_agent_config(agent_name):
         if response.data:
             return response.data[0]
         
-        # Fallback configs
-        default_configs = {
-            "Curator": {
-                "system_instruction": "Você é um curador de conteúdo. Extraia os insights mais importantes e relevantes do texto fornecido.",
-                "temperature": 0.1
-            },
-            "Ghostwriter": {
-                "system_instruction": "Você é um ghostwriter profissional. Crie conteúdo engajante e viral baseado nos insights fornecidos.",
-                "temperature": 0.7
-            }
-        }
-        return default_configs.get(agent_name, {"system_instruction": "Você é um assistente útil.", "temperature": 0.1})
+
     except Exception as e:
         log_execution("CONFIG", "ERROR", f"Erro ao buscar config de {agent_name}: {e}")
-        return {"system_instruction": "Você é um assistente útil.", "temperature": 0.1}
 
 def log_execution(agent_name, level, message):
     """Registra logs no console e Supabase"""
@@ -191,6 +182,8 @@ class ContentState(TypedDict):
     final_draft: Optional[str]
     status: str
     error_count: int
+    image_prompt: Optional[str]
+    image_url: Optional[str] # A URL final da imagem
 
 # --- NÓS DO GRAFO ---
 def ingest_node(state: ContentState):
@@ -284,6 +277,44 @@ FONTE ORIGINAL: {state['source_type']}
         log_execution(agent_name, "ERROR", f"Erro: {str(e)}")
         return {"status": "failed", "error_count": state.get("error_count", 0) + 1}
 
+def visual_artist_node(state: ContentState):
+    """Gera prompt, cria imagem e SALVA no Supabase Storage"""
+    agent_name = "VisualArtist"
+    log_execution(agent_name, "INFO", "🎨 Criando e salvando arte...")
+
+    try:
+        # --- [Mesma lógica de antes para gerar Prompt] ---
+        prompt_instruction = "Crie um prompt visual em inglês para este artigo. Estilo fotorealista, sem texto. Máx 30 palavras."
+        msg = [SystemMessage(content=prompt_instruction), HumanMessage(content=state['final_draft'][:2000])]
+        image_prompt = llm.invoke(msg).content.strip()
+        
+        # --- [Gera URL Temporária do Pollinations] ---
+        import urllib.parse
+        encoded = urllib.parse.quote(image_prompt)
+        seed = int(time.time())
+        temp_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&seed={seed}&model=flux&nologo=true"
+        
+        log_execution(agent_name, "INFO", "Imagem gerada, iniciando upload para cofre...")
+
+        # --- [NOVO: A Mágica do Storage] ---
+        # Usamos o ID do post como nome base do arquivo
+        permanent_url = upload_image_to_supabase(temp_url, state['row_id'])
+        
+        if not permanent_url:
+            # Fallback: se o upload falhar, usa a temporária mesmo para não parar a produção
+            permanent_url = temp_url
+            log_execution(agent_name, "WARNING", "Usando URL temporária devido a erro no upload.")
+
+        return {
+            "image_prompt": image_prompt, 
+            "image_url": permanent_url, # Agora esta é a URL do SEU Supabase
+            "status": "illustrated"
+        }
+
+    except Exception as e:
+        log_execution(agent_name, "ERROR", f"Erro visual: {str(e)}")
+        return {"image_url": None, "status": "illustrated_failed"}
+    
 def publisher_node(state: ContentState):
     """Publica o conteúdo final"""
     log_execution("Publisher", "INFO", f"Publicando item {state['row_id']}")
@@ -291,12 +322,13 @@ def publisher_node(state: ContentState):
     try:
         # Salva conteúdo pronto
         supabase.table("ready_materials").insert({
-            "raw_material_id": state['row_id'],
-            "platform": "general",
-            "final_content": state['final_draft'],
-            "virality_score": 85,
-            "created_at": datetime.utcnow().isoformat()
-        }).execute()
+        "raw_material_id": state['row_id'],
+        "platform": "general",
+        "final_content": state['final_draft'],
+        "image_url": state.get('image_url'), # <--- ADICIONE ISTO
+        "virality_score": 85,
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
         
         # Marca como concluído
         supabase.table("raw_materials").update({
@@ -338,6 +370,38 @@ def route_on_failure(state: ContentState):
             return END
     return None  # Continua normalmente
 
+def upload_image_to_supabase(image_url: str, file_name: str) -> str:
+    """
+    Baixa a imagem de uma URL pública e faz upload para o Supabase Storage.
+    Retorna a URL pública definitiva do Supabase.
+    """
+    try:
+        # 1. Baixar a imagem para a memória (RAM)
+        response = requests.get(image_url)
+        response.raise_for_status()
+        image_bytes = response.content
+        
+        # 2. Definir o caminho no bucket (ex: images/uuid_timestamp.png)
+        path = f"{file_name}_{int(time.time())}.png"
+        
+        # 3. Upload para o Supabase
+        # O bucket DEVE se chamar 'content-images' e ser PÚBLICO
+        res = supabase.storage.from_("content-images").upload(
+            path=path,
+            file=image_bytes,
+            file_options={"content-type": "image/png"}
+        )
+        
+        # 4. Obter a URL pública
+        public_url = supabase.storage.from_("content-images").get_public_url(path)
+        
+        log_execution("StorageManager", "SUCCESS", f"Imagem salva permanentemente: {path}")
+        return public_url
+
+    except Exception as e:
+        log_execution("StorageManager", "ERROR", f"Falha no upload: {str(e)}")
+        return None
+
 # --- MONTAGEM DO GRAFO ---
 builder = StateGraph(ContentState)
 
@@ -346,12 +410,14 @@ builder.add_node("Ingestor", ingest_node)
 builder.add_node("Curator", curator_node)
 builder.add_node("Writer", writer_node)
 builder.add_node("Publisher", publisher_node)
+builder.add_node("VisualArtist", visual_artist_node)
 
 # Define fluxo
 builder.add_edge(START, "Ingestor")
 builder.add_conditional_edges("Ingestor", route_ingestor)
 builder.add_edge("Curator", "Writer")
-builder.add_edge("Writer", "Publisher")
+builder.add_edge("Writer", "VisualArtist")
+builder.add_edge("VisualArtist", "Publisher")
 builder.add_edge("Publisher", END)
 
 # Compila o grafo
