@@ -343,40 +343,42 @@ def visual_artist_node(state: ContentState):
         return {"image_url": None, "status": "illustrated_failed"}
 
 def publisher_node(state: ContentState):
-    """Publica o conteúdo final"""
-    log_execution("Publisher", "INFO", f"Publicando item {state['row_id']}")
+    """Publica o conteúdo e a IMAGEM final"""
+    log_execution("Publisher", "INFO", f"Iniciando publicação do item {state['row_id']}")
+    
+    # --- DEBUG: Verificação de Sanidade ---
+    # Isso vai aparecer no seu log e nos dirá se a imagem chegou até aqui
+    img_debug = state.get("image_url")
+    log_execution("Publisher", "INFO", f"🔍 URL da Imagem recebida no State: {img_debug}")
     
     try:
-        # Salva conteúdo pronto
-        supabase.table("ready_materials").insert({
-        "raw_material_id": state['row_id'],
-        "platform": "general",
-        "final_content": state['final_draft'],
-        "image_url": state.get('image_url'), # <--- ADICIONE ISTO
-        "virality_score": 85,
-        "created_at": datetime.utcnow().isoformat()
-    }).execute()
+        # Prepara o payload
+        payload = {
+            "raw_material_id": state['row_id'],
+            "platform": "general",
+            "final_content": state['final_draft'],
+            # ESTA LINHA É A CHAVE DO COFRE. ELA PRECISA EXISTIR:
+            "image_url": state.get("image_url"), 
+            "virality_score": 85,
+            "created_at": datetime.utcnow().isoformat()
+        }
+
+        # Insere no banco
+        response = supabase.table("ready_materials").insert(payload).execute()
         
-        # Marca como concluído
+        # Marca raw_material como concluído
         supabase.table("raw_materials").update({
             "status": "done",
             "updated_at": datetime.utcnow().isoformat()
         }).eq("id", state['row_id']).execute()
         
-        log_execution("Publisher", "SUCCESS", f"Item {state['row_id']} publicado!")
+        log_execution("Publisher", "SUCCESS", f"Item publicado COM IMAGEM: {img_debug}")
         return {"status": "finished"}
     
     except Exception as e:
         log_execution("Publisher", "ERROR", f"Erro ao publicar: {str(e)}")
-        
-        # Marca como failed
-        supabase.table("raw_materials").update({
-            "status": "failed",
-            "updated_at": datetime.utcnow().isoformat()
-        }).eq("id", state['row_id']).execute()
-        
         return {"status": "failed"}
-
+    
 # --- ROTEAMENTO ---
 def route_ingestor(state: ContentState):
     """Decide o próximo passo após ingestão"""
