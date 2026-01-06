@@ -2,7 +2,7 @@ import os
 import time
 import threading
 from typing import TypedDict, Optional
-from flask import Flask
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
 # LangChain / LangGraph / Supabase
@@ -15,13 +15,42 @@ from supabase import create_client, Client
 load_dotenv()
 
 # ==========================================
-# PARTE 1: CONFIGURAÇÃO DO SERVIDOR (O "HACK")
+# PARTE 1: CONFIGURAÇÃO DO SERVIDOR (FLASK API)
 # ==========================================
 app = Flask(__name__)
 
+# Rota de verificação (Health Check)
 @app.route('/')
 def home():
-    return "O Agente DeepSeek está rodando em background! 🚀"
+    return "Agente Operacional. Use /ingest para enviar dados via POST."
+
+# --- NOVA ROTA: Ingestão de Dados (Substituto do n8n) ---
+@app.route('/ingest', methods=['POST'])
+def ingest_data():
+    """
+    Recebe um JSON e salva na tabela raw_materials.
+    Esperado: {"text": "conteúdo aqui", "source": "youtube/twitter/etc"}
+    """
+    try:
+        data = request.json
+        content_text = data.get('text')
+        source_type = data.get('source', 'api_push')
+        
+        if not content_text:
+            return jsonify({"error": "Campo 'text' é obrigatório"}), 400
+            
+        # Inserção direta no Supabase
+        response = supabase.table("raw_materials").insert({
+            "content_text": content_text,
+            "source_type": source_type,
+            "status": "pending" 
+        }).execute()
+        
+        # Retorna sucesso com o ID criado
+        return jsonify({"status": "success", "id": response.data[0]['id']}), 201
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 def run_flask():
     # O Render injeta a variável PORT automaticamente
@@ -29,7 +58,7 @@ def run_flask():
     app.run(host='0.0.0.0', port=port)
 
 # ==========================================
-# PARTE 2: CONFIGURAÇÃO DO AGENTE (SEU CÓDIGO)
+# PARTE 2: CONFIGURAÇÃO DO AGENTE (LANGGRAPH)
 # ==========================================
 
 # Configuração DeepSeek (Via OpenAI Client)
@@ -80,6 +109,7 @@ class ContentState(TypedDict):
 
 def ingest_node(state: ContentState):
     print("--- 1. INGESTOR ---")
+    # Busca item pendente
     response = supabase.table("raw_materials").select("*").eq("status", "pending").limit(1).execute()
     data = response.data
     
@@ -87,7 +117,7 @@ def ingest_node(state: ContentState):
         return {"status": "no_data"}
     
     item = data[0]
-    # Trava o item
+    # Trava o item (Processing)
     supabase.table("raw_materials").update({"status": "processing"}).eq("id", item['id']).execute()
         
     return {
@@ -121,6 +151,7 @@ def writer_node(state: ContentState):
 
 def publisher_node(state: ContentState):
     print("--- 4. PUBLISHER ---")
+    # Salva o resultado final
     supabase.table("ready_materials").insert({
         "raw_material_id": state['row_id'],
         "platform": "general",
@@ -128,6 +159,7 @@ def publisher_node(state: ContentState):
         "virality_score": 85
     }).execute()
     
+    # Marca como concluído
     supabase.table("raw_materials").update({"status": "done"}).eq("id", state['row_id']).execute()
     return {"status": "finished"}
 
