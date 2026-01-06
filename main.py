@@ -278,43 +278,70 @@ FONTE ORIGINAL: {state['source_type']}
         return {"status": "failed", "error_count": state.get("error_count", 0) + 1}
 
 def visual_artist_node(state: ContentState):
-    """Gera prompt, cria imagem e SALVA no Supabase Storage"""
     agent_name = "VisualArtist"
-    log_execution(agent_name, "INFO", "🎨 Criando e salvando arte...")
+    log_execution(agent_name, "INFO", "🎨 Iniciando processo visual...")
+    
+    # URL Padrão (Fallback) caso tudo falhe
+    final_url = "https://placehold.co/600x400?text=Image+Error" 
 
     try:
-        # --- [Mesma lógica de antes para gerar Prompt] ---
-        prompt_instruction = "Crie um prompt visual em inglês para este artigo. Estilo fotorealista, sem texto. Máx 30 palavras."
-        msg = [SystemMessage(content=prompt_instruction), HumanMessage(content=state['final_draft'][:2000])]
-        image_prompt = llm.invoke(msg).content.strip()
+        # 1. Gerar Prompt
+        prompt_instruction = "Create a prompt for a cover image. Style: Photorealistic, 8k. Max 15 words. Just the prompt."
+        msg = [SystemMessage(content=prompt_instruction), HumanMessage(content=state.get('final_draft', '')[:500])]
         
-        # --- [Gera URL Temporária do Pollinations] ---
-        import urllib.parse
+        # Proteção contra falha do LLM
+        try:
+            image_prompt = llm.invoke(msg).content.strip()
+        except:
+            image_prompt = "Abstract digital art technology background blue and orange"
+            
+        # 2. Gerar URL do Pollinations
         encoded = urllib.parse.quote(image_prompt)
         seed = int(time.time())
-        temp_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&seed={seed}&model=flux&nologo=true"
+        pollinations_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&seed={seed}&model=flux&nologo=true"
         
-        log_execution(agent_name, "INFO", "Imagem gerada, iniciando upload para cofre...")
-
-        # --- [NOVO: A Mágica do Storage] ---
-        # Usamos o ID do post como nome base do arquivo
-        permanent_url = upload_image_to_supabase(temp_url, state['row_id'])
+        # Assume a URL do Pollinations como a "oficial" temporariamente
+        final_url = pollinations_url
         
-        if not permanent_url:
-            # Fallback: se o upload falhar, usa a temporária mesmo para não parar a produção
-            permanent_url = temp_url
-            log_execution(agent_name, "WARNING", "Usando URL temporária devido a erro no upload.")
+        # 3. Tentar Upload para o Supabase (Try/Except Isolado)
+        try:
+            log_execution(agent_name, "INFO", "Tentando upload para Storage...")
+            
+            # Download
+            img_data = requests.get(pollinations_url, timeout=10).content
+            
+            # Nome do arquivo
+            file_path = f"{state['row_id']}_{seed}.png"
+            
+            # Upload
+            supabase.storage.from_("content-images").upload(
+                file_path,
+                img_data,
+                {"content-type": "image/png"}
+            )
+            
+            # Pega URL Pública
+            supabase_url = supabase.storage.from_("content-images").get_public_url(file_path)
+            
+            # Se chegou aqui, sucesso!
+            final_url = supabase_url
+            log_execution(agent_name, "SUCCESS", "✅ Imagem salva no Storage!")
+            
+        except Exception as storage_error:
+            # Se der erro no storage, APENAS LOGA. Não para o fluxo.
+            # O sistema vai usar a 'pollinations_url' definida antes.
+            log_execution(agent_name, "WARNING", f"Falha no Storage (usando Link Direto): {storage_error}")
 
         return {
             "image_prompt": image_prompt, 
-            "image_url": permanent_url, # Agora esta é a URL do SEU Supabase
+            "image_url": final_url, 
             "status": "illustrated"
         }
 
     except Exception as e:
-        log_execution(agent_name, "ERROR", f"Erro visual: {str(e)}")
+        log_execution(agent_name, "ERROR", f"Erro fatal no artista: {e}")
         return {"image_url": None, "status": "illustrated_failed"}
-    
+
 def publisher_node(state: ContentState):
     """Publica o conteúdo final"""
     log_execution("Publisher", "INFO", f"Publicando item {state['row_id']}")
