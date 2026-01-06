@@ -1,0 +1,6 @@
+flask
+langchain
+langchain-openai
+langgraph
+supabase
+python-dotenv
